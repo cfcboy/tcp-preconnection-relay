@@ -129,6 +129,6 @@ REMOTE_IP:REMOTE_TCP_PORT
 
 * 日本优化Gomami：https://www.gomami.io (贵，无aff）
 * 美国西雅图落地：https://www.misaka.io (贵，无aff，商家也没开aff功能）
-* 美国西雅图落地：https://bug.pw （便宜点，日本过去延时稳定82ms，带宽现在比misaka足且稳定，所以有aff）
+* 美国西雅图落地：https://bug.pw?ref=Nifwr0tPxf （便宜点，日本过去延时稳定82ms，带宽现在比misaka足且稳定，所以有aff）
 
 
