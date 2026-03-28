@@ -114,10 +114,9 @@ REMOTE_IP:REMOTE_TCP_PORT
 
 ---
 
-## 说明
+## 效果示例
+无预链接的转发（使用realm）：
+<img width="2337" height="277" alt="image" src="https://github.com/user-attachments/assets/cba16059-ded2-43da-b571-0bcaff2ea70b" />
+有预链接的转发:
+<img width="335" height="35" alt="image" src="https://github.com/user-attachments/assets/67824207-ade4-4289-9041-b806fe5075cf" />
 
-这个程序就是一个：
-
-```
-TCP/UDP 转发 + 连接预热（降低延迟）
-```
