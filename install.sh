@@ -11,14 +11,33 @@ mkdir -p /etc/tcp_pool
 
 cat > /etc/tcp_pool/default.conf <<EOF
 #REQUIRED
+#转发标识，中括号内填写标签，比如US,HK1,HK2
+[]
+#本地ip，如果监听v4网卡就填写0.0.0.0。如果是v6则为俩英文冒号::。只监听本机某个特定网卡ip就填那个ip就行，比如127.0.0.0，38.175.100.122。
+LOCAL_IP=
 #本地端口，记得ufw或者服务商的防火墙打开
 LOCAL_PORT=
-#远端ip，你转发的目标服务器
+#远端ip，你转发的目标服务器，现在支持v6和域名
 REMOTE_IP=
 #远端的接收TCP的端口
 REMOTE_TCP_PORT=
 #远端的接收UDP的端口（如果你的服务端UDP和TCP跑在一个端口的，填写一样就行）
 REMOTE_UDP_PORT=
+
+#样例，看懂了删掉就行(ctrl k 快速一行行清除，小小白白可能不知道)。现在支持单文件多配置，格式就是标签加上后面一坨东西。
+[US]
+LOCAL_IP=0.0.0.0
+LOCAL_PORT=11451
+REMOTE_IP=38.125.91.68
+REMOTE_TCP_PORT=8888
+REMOTE_UDP_PORT=9999
+
+[HK]
+LOCAL_IP=::
+LOCAL_PORT=11451
+REMOTE_IP=域名.com
+REMOTE_TCP_PORT=8888
+REMOTE_UDP_PORT=9999
 EOF
 
 cat > /etc/systemd/system/tcp-pool@.service <<EOF
