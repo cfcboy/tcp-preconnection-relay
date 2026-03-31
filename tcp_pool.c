@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -21,9 +22,14 @@
 #include <unistd.h>
 
 //配置
-#define LOCAL_IP    "0.0.0.0"
+static char *LOCAL_IP;   // 你配置读取后赋值
+static struct sockaddr_storage local_bind_addr;
+static socklen_t local_bind_addrlen;
+static struct sockaddr_storage remote_tcp_addr;
+static socklen_t remote_tcp_addrlen;
+static struct sockaddr_storage remote_udp_addr;
+static socklen_t remote_udp_addrlen;
 static int LOCAL_PORT; //本地端口，记得ufw或者服务商防火墙放开，我老是忘
-
 static char *REMOTE_IP;
 static int REMOTE_TCP_PORT; //目标服务器TCP端口
 static int REMOTE_UDP_PORT; //目标服务器UDP端口
@@ -140,6 +146,32 @@ static void log_flush_all_force(void) {
 }
 
 //工具函数
+static int resolve_addr(const char *host, int port, int socktype,
+                        struct sockaddr_storage *out, socklen_t *outlen) {
+    struct addrinfo hints, *res = NULL, *rp = NULL;
+    char portstr[16];
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;      // v4 / v6 都行
+    hints.ai_socktype = socktype;
+    hints.ai_flags = AI_NUMERICSERV;
+
+    snprintf(portstr, sizeof(portstr), "%d", port);
+
+    int rc = getaddrinfo(host, portstr, &hints, &res);
+    if (rc != 0) return -1;
+
+    for (rp = res; rp; rp = rp->ai_next) {
+        if ((socklen_t)rp->ai_addrlen > sizeof(*out)) continue;
+        memcpy(out, rp->ai_addr, rp->ai_addrlen);
+        *outlen = (socklen_t)rp->ai_addrlen;
+        freeaddrinfo(res);
+        return 0;
+    }
+
+    freeaddrinfo(res);
+    return -1;
+}
 static uint64_t mono_ms(void) {//获取单调时间
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -228,20 +260,15 @@ static int pool_get_locked(void) {//取连接
 
 static void *thread_refill(void *arg) {//连接线程补充
     (void)arg;
+//打个标，我在这改过，防止忘了
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(REMOTE_TCP_PORT);
-    inet_pton(AF_INET, REMOTE_IP, &addr.sin_addr);
-
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int s = socket(((struct sockaddr*)&remote_tcp_addr)->sa_family, SOCK_STREAM, 0);
     if (s < 0) goto fin;
 
     set_tcp_socket_options(s);
     if (set_nonblock(s) != 0) { close(s); goto fin; }
 
-    int rc = connect(s, (struct sockaddr*)&addr, sizeof(addr));
+    int rc = connect(s, (struct sockaddr*)&remote_tcp_addr, remote_tcp_addrlen);
     if (rc == 0) goto success;
     if (errno != EINPROGRESS) { close(s); goto fin; }
 
@@ -402,7 +429,7 @@ static pump_status_t pump(int src_fd, int dst_fd, int pipe_in, int pipe_out,//�
 
 //UDP转发，每客户端一个socket
 typedef struct UdpAssoc {
-    struct sockaddr_in cli;
+    struct sockaddr_storage cli;
     socklen_t cli_len;
     int up_fd;
     uint64_t last_act;
@@ -410,22 +437,54 @@ typedef struct UdpAssoc {
 } UdpAssoc;
 
 static UdpAssoc *udp_tab[UDP_TABLE_SIZE];
-static struct sockaddr_in remote_udp_addr;
 static int udp_listen_fd = -1;
 
-static inline uint32_t udp_hash(uint32_t ip_be, uint16_t port_be) {
-    uint32_t ip = ntohl(ip_be);
-    uint32_t port = ntohs(port_be);
-    uint32_t x = ip ^ (ip >> 16) ^ (port * 2654435761u);
-    return x & (UDP_TABLE_SIZE - 1);
+static inline uint32_t udp_hash_addr(const struct sockaddr_storage *a) {
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in *v4 = (const struct sockaddr_in*)a;
+        uint32_t ip = ntohl(v4->sin_addr.s_addr);
+        uint32_t port = ntohs(v4->sin_port);
+        uint32_t x = ip ^ (ip >> 16) ^ (port * 2654435761u);
+        return x & (UDP_TABLE_SIZE - 1);
+    }
+
+    if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6*)a;
+        const uint32_t *p = (const uint32_t*)&v6->sin6_addr;
+        uint32_t x = p[0] ^ p[1] ^ p[2] ^ p[3] ^ ntohs(v6->sin6_port);
+        return x & (UDP_TABLE_SIZE - 1);
+    }
+
+    return 0;
 }
 
-static inline bool udp_addr_eq(const struct sockaddr_in *a, const struct sockaddr_in *b) {
-    return a->sin_addr.s_addr == b->sin_addr.s_addr && a->sin_port == b->sin_port;
+static inline bool udp_addr_eq(const struct sockaddr_storage *a,
+                               const struct sockaddr_storage *b) {
+    if (a->ss_family != b->ss_family) return false;
+
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in *x = (const struct sockaddr_in*)a;
+        const struct sockaddr_in *y = (const struct sockaddr_in*)b;
+        return x->sin_port == y->sin_port &&
+               x->sin_addr.s_addr == y->sin_addr.s_addr;
+    }
+
+    if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *x = (const struct sockaddr_in6*)a;
+        const struct sockaddr_in6 *y = (const struct sockaddr_in6*)b;
+        return x->sin6_port == y->sin6_port &&
+               x->sin6_scope_id == y->sin6_scope_id &&
+               memcmp(&x->sin6_addr, &y->sin6_addr, sizeof(x->sin6_addr)) == 0;
+    }
+
+    return false;
 }
 
-static UdpAssoc* udp_get_or_create(const struct sockaddr_in *cli, uint64_t now_ms, int epfd_) {
-    uint32_t idx = udp_hash(cli->sin_addr.s_addr, cli->sin_port);
+static UdpAssoc* udp_get_or_create(const struct sockaddr_storage *cli,
+                                   socklen_t cli_len,
+                                   uint64_t now_ms,
+                                   int epfd_) {
+    uint32_t idx = udp_hash_addr(cli);
 
     UdpAssoc *p = udp_tab[idx];
     while (p) {
@@ -433,16 +492,16 @@ static UdpAssoc* udp_get_or_create(const struct sockaddr_in *cli, uint64_t now_m
         p = p->next;
     }
 
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int fd = socket(((struct sockaddr*)&remote_udp_addr)->sa_family, SOCK_DGRAM, 0);
     if (fd < 0) return NULL;
     set_udp_socket_options(fd);
     if (set_nonblock(fd) != 0) { close(fd); return NULL; }
-    if (connect(fd, (struct sockaddr*)&remote_udp_addr, sizeof(remote_udp_addr)) != 0) { close(fd); return NULL; }
+    if (connect(fd, (struct sockaddr*)&remote_udp_addr, remote_udp_addrlen) != 0) { close(fd); return NULL; }
 
     UdpAssoc *n = (UdpAssoc*)calloc(1, sizeof(UdpAssoc));
     if (!n) { close(fd); return NULL; }
-    n->cli = *cli;
-    n->cli_len = sizeof(*cli);
+    memcpy(&n->cli, cli, cli_len);
+    n->cli_len = cli_len;
     n->up_fd = fd;
     n->last_act = now_ms;
 
@@ -471,6 +530,11 @@ static void udp_remove(UdpAssoc *u, uint32_t idx, int epfd_) {
 
 int main() {
     char *env;
+    LOCAL_IP = getenv("LOCAL_IP");
+    if (!LOCAL_IP) {
+        fprintf(stderr, "ERROR: LOCAL_IP not set\n");
+        exit(1);
+    }
     env = getenv("LOCAL_PORT");
     if (!env) {
         fprintf(stderr, "ERROR: LOCAL_PORT not set\n");
@@ -496,6 +560,20 @@ int main() {
     REMOTE_UDP_PORT = atoi(env);
     printf("Using config: %s:%d → %d/%d\n",
        REMOTE_IP, REMOTE_TCP_PORT, REMOTE_TCP_PORT, REMOTE_UDP_PORT);
+    if (resolve_addr(LOCAL_IP, LOCAL_PORT, SOCK_STREAM, &local_bind_addr, &local_bind_addrlen) != 0) {
+        fprintf(stderr, "ERROR: resolve LOCAL_IP failed: %s:%d\n", LOCAL_IP, LOCAL_PORT);
+        exit(1);
+    }
+
+    if (resolve_addr(REMOTE_IP, REMOTE_TCP_PORT, SOCK_STREAM, &remote_tcp_addr, &remote_tcp_addrlen) != 0) {
+        fprintf(stderr, "ERROR: resolve REMOTE_TCP failed: %s:%d\n", REMOTE_IP, REMOTE_TCP_PORT);
+        exit(1);
+    }
+
+    if (resolve_addr(REMOTE_IP, REMOTE_UDP_PORT, SOCK_DGRAM, &remote_udp_addr, &remote_udp_addrlen) != 0) {
+        fprintf(stderr, "ERROR: resolve REMOTE_UDP failed: %s:%d\n", REMOTE_IP, REMOTE_UDP_PORT);
+        exit(1);
+    }
     struct rlimit r = {65535, 65535};
     (void)setrlimit(RLIMIT_NOFILE, &r);
     signal(SIGPIPE, SIG_IGN);
@@ -507,20 +585,16 @@ int main() {
     epfd = epoll_create1(0);
     if (epfd < 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
 
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);//tcp监听
+    int listen_fd = socket(((struct sockaddr*)&local_bind_addr)->sa_family, SOCK_STREAM, 0);//tcp监听
     if (listen_fd < 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
 
     int one = 1;
     (void)setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     if (set_nonblock(listen_fd) != 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(LOCAL_PORT);
-    inet_pton(AF_INET, LOCAL_IP, &addr.sin_addr);
+//打个标
 
-    if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 || listen(listen_fd, 4096) < 0) {
+    if (bind(listen_fd, (struct sockaddr*)&local_bind_addr, local_bind_addrlen) < 0 || listen(listen_fd, 4096) < 0) {
         log_enqueue("socket listen failed");
         log_flush_all_force();
         return 1;
@@ -535,21 +609,18 @@ int main() {
         return 1;
     }
 
-    udp_listen_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    udp_listen_fd = socket(((struct sockaddr*)&local_bind_addr)->sa_family, SOCK_DGRAM, 0);
     if (udp_listen_fd < 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
     set_udp_socket_options(udp_listen_fd);
     (void)setsockopt(udp_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     if (set_nonblock(udp_listen_fd) != 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
-    if (bind(udp_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (bind(udp_listen_fd, (struct sockaddr*)&local_bind_addr, local_bind_addrlen) < 0) {
         log_enqueue("socket listen failed");
         log_flush_all_force();
         return 1;
     }
 
-    memset(&remote_udp_addr, 0, sizeof(remote_udp_addr));
-    remote_udp_addr.sin_family = AF_INET;
-    remote_udp_addr.sin_port = htons(REMOTE_UDP_PORT);
-    inet_pton(AF_INET, REMOTE_IP, &remote_udp_addr.sin_addr);
+//打个标
 
     ev.events = EPOLLIN | EPOLLET;
     ev.data.ptr = TAG_UDP_LISTEN;
@@ -586,18 +657,14 @@ int main() {
                     if (rem < 0) {//如果并发太高了，那么直接按照传统方式转发连接
                         log_enqueue("Exceeded Connections Pool, Direct Out...");
 
-                        struct sockaddr_in raddr;
-                        memset(&raddr, 0, sizeof(raddr));
-                        raddr.sin_family = AF_INET;
-                        raddr.sin_port = htons(REMOTE_TCP_PORT);
-                        inet_pton(AF_INET, REMOTE_IP, &raddr.sin_addr);
+//打个标
 
-                        rem = socket(AF_INET, SOCK_STREAM, 0);
+                        rem = socket(((struct sockaddr*)&remote_tcp_addr)->sa_family, SOCK_STREAM, 0);
                         if (rem < 0) { close(cli); continue; }
                         set_tcp_socket_options(rem);
                         if (set_nonblock(rem) != 0) { close(rem); close(cli); continue; }
                         //fallback这里问题调整了一下///////////////////////////////////QAQ
-                        int rc = connect(rem, (struct sockaddr*)&raddr, sizeof(raddr));
+                        int rc = connect(rem, (struct sockaddr*)&remote_tcp_addr, remote_tcp_addrlen);
                         if (rc != 0) {
                             if (errno != EINPROGRESS) {
                                 close(rem);
@@ -658,7 +725,7 @@ int main() {
             if (tagp == TAG_UDP_LISTEN) {
                 while (1) {
                     uint8_t buf[65535];
-                    struct sockaddr_in cli;
+                    struct sockaddr_storage cli;
                     socklen_t clen = sizeof(cli);
 
                     ssize_t n = recvfrom(udp_listen_fd, buf, sizeof(buf), 0, (struct sockaddr*)&cli, &clen);
@@ -666,9 +733,8 @@ int main() {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         break;
                     }
-                    if (clen != sizeof(struct sockaddr_in)) continue;
 
-                    UdpAssoc *u = udp_get_or_create(&cli, now, epfd);
+                    UdpAssoc *u = udp_get_or_create(&cli, clen, now, epfd);
                     if (!u) continue;
 
                     ssize_t s = send(u->up_fd, buf, (size_t)n, MSG_DONTWAIT);
