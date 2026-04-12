@@ -201,8 +201,15 @@ while IFS= read -r raw || [ -n "$raw" ]; do
     [[ "$line" == \#* ]] && continue
     [[ "$line" == \;* ]] && continue
 
-    if [[ "$line" =~ ^\[([A-Za-z0-9_-]+)\]$ ]]; then
-        next_section="${BASH_REMATCH[1]}"
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+        tag="${BASH_REMATCH[1]}"
+    
+        if [[ ! "$tag" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "标签不合法（只能包含字母数字下划线横杠，参考python变量格式）: [$tag]" >&2
+            exit 1
+        fi
+    
+        next_section="$tag"
     
         validate_and_write_section
     
@@ -225,7 +232,7 @@ while IFS= read -r raw || [ -n "$raw" ]; do
         key="${BASH_REMATCH[1]}"
         val="$(trim "${BASH_REMATCH[2]}")"
     else
-        echo "标签不合法，参考python变量名 [$current]: $line" >&2
+        echo "配置项不合法 [$current]: $line" >&2
         exit 1
     fi
 
