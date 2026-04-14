@@ -381,7 +381,7 @@ static void conn_watch(Conn *c) {
     uint32_t ev_l = EPOLLET;
     uint32_t ev_r = EPOLLET;
 
-    //只在未收到EOF的方向上监听EPOLLRDHUP，防止EPOLL_CTL_MOD重新激活ET边沿导致死循环
+    //只在未收到EOF的方向上监听EPOLLRDHUP
     if (!c->eof_l2r) {
         ev_l |= EPOLLRDHUP;
         if (c->len_l2r < SPLICE_CHUNK) ev_l |= EPOLLIN;
